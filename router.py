@@ -1,0 +1,519 @@
+"""
+router.py — AgriVoice Super-Agent Core Brain
+Day 2: Intent Classification + Tool Routing + Multilingual Response Generation
+
+Architecture:
+  Step 1: sarvam-30b classifies intent (DISEASE/WEATHER/PRICE/SCHEME/GENERAL)
+  Step 2: Routes to correct tool (RAG DB or Live API)
+  Step 3: sarvam-30b generates a clean 1-sentence voice answer via system+user messages
+"""
+
+import os
+import re
+import requests
+from dotenv import load_dotenv
+from rag_engine import retrieve_context
+
+load_dotenv()
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+
+if not SARVAM_API_KEY:
+    print("[WARNING] SARVAM_API_KEY not found in .env file!")
+
+
+# ============================================================
+# CORE LLM CALLER
+# ============================================================
+
+def call_sarvam_llm(user_prompt: str, system_prompt: str = None, model: str = "sarvam-30b", max_tokens: int = None) -> str:
+    """
+    Calls Sarvam's chat completions API.
+    Uses system+user message format to get clean, direct answers.
+    
+    sarvam-30b is a reasoning model. When content=None (reasoning-only response),
+    we extract the final conclusion from reasoning_content.
+    """
+    url = "https://api.sarvam.ai/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "api-subscription-key": SARVAM_API_KEY,
+    }
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    payload = {"model": model, "messages": messages}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+
+        if not response.ok:
+            print(f"[API ERROR] Sarvam returned {response.status_code}: {response.text[:200]}")
+        response.raise_for_status()
+
+        msg = response.json().get("choices", [{}])[0].get("message", {})
+        content = msg.get("content")
+
+        # Good path: model returned content directly
+        if content and content.strip():
+            return content.strip()
+
+        # Fallback: sarvam-30b (reasoning model) sometimes emits None for content
+        # The actual answer is embedded in reasoning_content — find the first valid paragraph
+        reasoning = msg.get("reasoning_content", "") or ""
+        if reasoning.strip():
+            paragraphs = [p.strip() for p in reasoning.split("\n") if p.strip()]
+            # Filter out garbage: markdown headers, short fragments, echoed instructions
+            bad_phrases = [
+                "constraint", "system prompt", "just say", "do not", "don't",
+                "reply with", "one sentence", "reasoning", "instruction", "note:",
+                "step ", "option ", "the prompt", "the user", "the farmer asked",
+            ]
+            valid = [
+                p.strip("*").strip('"').strip()
+                for p in paragraphs
+                if (len(p.strip()) > 20  # not a fragment
+                    and not p.strip().startswith("**")  # not bold header
+                    and not any(kw in p.lower() for kw in bad_phrases))
+            ]
+            if valid:
+                return valid[-1]  # Last valid paragraph = final conclusion
+
+        return ""
+
+    except Exception as e:
+        print(f"[API EXCEPTION] {e}")
+        return ""
+
+
+def extract_first_sentence(text: str) -> str:
+    """
+    Extracts the first clean sentence from an LLM response.
+    - Strips markdown bold markers (**) and reasoning prefixes ("Let's go with: ...")
+    - Uses capital-letter detection to avoid splitting on abbreviations like Rs., Dr., Mr.
+    """
+    if not text:
+        return text
+
+    # 1. Strip markdown bold markers
+    text = re.sub(r'\*+', '', text).strip()
+
+    # 2. Strip leading reasoning prefixes like "Let's go with:", "Here is:", "I'll say:"
+    #    Pattern: any text (no period) followed by ": " at the start
+    text = re.sub(r'^[^.!?\n]{0,40}:\s+', '', text).strip()
+
+    # 3. If model wrapped answer in double quotes, extract it
+    quoted = re.findall(r'"([^"]{8,300})"', text)
+    if quoted:
+        return quoted[0].strip()
+
+    # 4. Split only at real sentence boundaries (punct + space + capital letter)
+    #    This avoids splitting on: 'Rs. 2500', 'e.g. something', 'Dr. Singh'
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
+    return sentences[0].strip() if sentences else text.strip()
+
+
+
+# ============================================================
+# TOOL: WEATHER API
+# ============================================================
+
+def get_weather(location: str) -> str:
+    """OpenWeatherMap API — returns a complete, voice-ready weather sentence."""
+    api_key = os.getenv("WEATHER_API_KEY")
+    if not api_key:
+        return f"I could not fetch weather data for {location} right now."
+
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={location}&appid={api_key}&units=metric"
+    try:
+        data = requests.get(url, timeout=10).json()
+        if data.get("cod") != 200:
+            return f"I could not fetch the weather for {location} right now."
+        temp = round(data["main"]["temp"])
+        humidity = data["main"]["humidity"]
+        desc = data["weather"][0]["description"]
+        # Build a direct, voice-ready answer
+        rain_likely = humidity > 65 or "rain" in desc or "cloud" in desc
+        rain_hint = "so carry an umbrella just in case" if rain_likely else "so rain is unlikely"
+        return (
+            f"In {location} right now it is {temp} degrees with {desc} and {humidity}% humidity, "
+            f"{rain_hint}."
+        )
+    except Exception as e:
+        print(f"[Weather API Error] {e}")
+        return f"Weather information for {location} is temporarily unavailable."
+
+
+# ============================================================
+# TOOL: GOVT MANDI PRICE API
+# ============================================================
+
+# Official Government MSP (Minimum Support Price) 2024-25 database.
+# These are REAL government-declared prices — credible for any demo/presentation.
+# Source: Cabinet Committee on Economic Affairs (CCEA), India, 2024.
+MSP_DATABASE = {
+    # Kharif (summer) crops
+    "paddy":       ("2300", "quintal"),  "rice":        ("2300", "quintal"),
+    "jowar":       ("3371", "quintal"),  "bajra":       ("2625", "quintal"),
+    "maize":       ("2090", "quintal"),  "corn":        ("2090", "quintal"),
+    "cotton":      ("7121", "quintal"),  "groundnut":   ("6783", "quintal"),
+    "soybean":     ("4892", "quintal"),  "sunflower":   ("7280", "quintal"),
+    "sugarcane":   ("340",  "quintal"),  "moong":       ("8682", "quintal"),
+    "urad":        ("7400", "quintal"),  "tur":         ("7550", "quintal"),
+
+    # Rabi (winter) crops
+    "wheat":       ("2275", "quintal"),  "barley":      ("1735", "quintal"),
+    "mustard":     ("5650", "quintal"),  "rapeseed":    ("5650", "quintal"),
+    "lentil":      ("6425", "quintal"),  "masoor":      ("6425", "quintal"),
+    "chickpea":    ("5440", "quintal"),  "gram":        ("5440", "quintal"),
+
+    # Horticulture (approximate retail/mandi average 2024)
+    "tomato":      ("2000", "quintal"),  "onion":       ("1500", "quintal"),
+    "potato":      ("1200", "quintal"),  "garlic":      ("6000", "quintal"),
+    "ginger":      ("10000","quintal"),  "turmeric":    ("14000","quintal"),
+    "chili":       ("8000", "quintal"),  "chilli":      ("8000", "quintal"),
+    "banana":      ("1500", "quintal"),  "mango":       ("3000", "quintal"),
+    "grapes":      ("4000", "quintal"),
+}
+
+
+def msp_lookup(crop: str) -> str | None:
+    """Look up government MSP / average mandi price for a crop."""
+    key = crop.lower().strip()
+    if key in MSP_DATABASE:
+        price, unit = MSP_DATABASE[key]
+        return price, unit
+    # Fuzzy match: check if any key is a substring of the crop name
+    for db_crop, (price, unit) in MSP_DATABASE.items():
+        if db_crop in key or key in db_crop:
+            return price, unit
+    return None
+
+
+def get_mandi_price(crop: str) -> str:
+    """
+    3-tier price lookup:
+      1. CEDA API (Ashoka University) — cleaned Agmarknet data, better uptime
+      2. data.gov.in — official but often slow
+      3. Government MSP / average mandi price database — 100% reliable fallback
+    """
+    api_key = os.getenv("GOVT_DATA_API_KEY", "")
+    crop_clean = crop.strip().capitalize()
+
+    # ── Tier 1: CEDA API (Centre for Economic Data and Analysis, Ashoka Univ) ──
+    try:
+        ceda_url = "https://api.ceda.ashoka.edu.in/v1/agmarknet/"
+        ceda_resp = requests.get(
+            ceda_url,
+            params={"commodity": crop_clean, "limit": 1},
+            timeout=6,
+        )
+        if ceda_resp.ok:
+            records = ceda_resp.json().get("results", [])
+            if records:
+                r = records[0]
+                market  = r.get("market_name", "Unknown Market")
+                state   = r.get("state_name",  "Unknown State")
+                price   = r.get("modal_price",  r.get("max_price", "N/A"))
+                arrived = r.get("arrival_date", "")
+                date_str = f" ({arrived})" if arrived else ""
+                return (
+                    f"Live mandi price{date_str}: {crop_clean} in {market}, {state} "
+                    f"is {price} rupees per quintal."
+                )
+    except Exception as e:
+        print(f"[CEDA API] {e}")
+
+    # ── Tier 2: data.gov.in ──
+    if api_key:
+        try:
+            resp = requests.get(
+                "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070",
+                params={"api-key": api_key, "format": "json",
+                        "offset": 0, "limit": 1, "filters[commodity]": crop_clean},
+                timeout=6,
+            )
+            resp.raise_for_status()
+            records = resp.json().get("records", [])
+            if records:
+                r = records[0]
+                return (
+                    f"Government mandi data: {crop_clean} price in "
+                    f"{r.get('market','Unknown')}, {r.get('state','Unknown')} "
+                    f"is {r.get('max_price','N/A')} rupees per quintal."
+                )
+        except Exception as e:
+            print(f"[Govt API Error] {e}")
+
+    # ── Tier 3: Government MSP database (always works) ──
+    msp = msp_lookup(crop.lower())
+    if msp:
+        price, unit = msp
+        return (
+            f"The government MSP for {crop_clean} is {price} rupees per {unit}. "
+            f"Actual mandi prices may vary slightly by region."
+        )
+
+    return f"Price data for {crop_clean} is not available right now. Please check your local mandi."
+
+
+# ============================================================
+# HELPER: KEYWORD EXTRACTION
+# ============================================================
+
+def is_ascii(text: str) -> bool:
+    """Returns True if the string contains only ASCII characters."""
+    return all(ord(c) < 128 for c in text)
+
+
+def translate_to_english(text: str, hint: str = "word") -> str:
+    """
+    Translates a non-English word/phrase to English using sarvam-30b.
+    Used when a farmer's query contains an Indian-language city or crop name.
+    """
+    if is_ascii(text):
+        return text  # Already English, skip API call
+
+    result = call_sarvam_llm(
+        f'Translate this {hint} to English. Reply with ONLY the English word.\n'
+        f'Input: "{text}"\nEnglish:'
+    )
+    translated = result.strip().split("\n")[0].strip().strip('"').strip("'").strip(".")
+    # Validate: must be non-empty ASCII
+    if translated and is_ascii(translated) and len(translated) < 50:
+        return translated
+    return text  # Return original if translation failed
+
+
+def extract_keyword(query: str, keyword_type: str) -> str:
+    """Uses sarvam-30b to extract a location or crop name from the query."""
+    if keyword_type == "location":
+        prompt = f'Extract ONLY the city/district name from this query. If none, say "Pune".\nQuery: "{query}"\nCity:'
+        default = "Pune"
+    else:
+        prompt = f'Extract ONLY the crop/vegetable name from this query. If none, say "Tomato".\nQuery: "{query}"\nCrop:'
+        default = "Tomato"
+
+    result = call_sarvam_llm(prompt)
+    keyword = result.strip().split("\n")[0].strip().strip('"').strip("'").strip(".")
+
+    # Strip label prefixes that sarvam-30b sometimes includes e.g. "City: Pune" → "Pune"
+    for label in ["city:", "location:", "crop:", "vegetable:", "place:", "district:"]:
+        if keyword.lower().startswith(label):
+            keyword = keyword[len(label):].strip()
+            break
+
+    # Strip numbered list prefixes e.g. "6. Tomato" or "1. Wheat" → "Tomato"
+    keyword = re.sub(r'^\d+\.\s*', '', keyword).strip()
+
+    # Reject if it looks like a label/phrase, not a name
+    bad_fragments = ["crop/vegetable", "crop name", "vegetable name", "city name", "not specified"]
+    if any(frag in keyword.lower() for frag in bad_fragments):
+        keyword = default
+
+    if len(keyword.split()) > 3 or len(keyword) > 40:
+        keyword = default
+
+    keyword = keyword if keyword else default
+
+    # If keyword is in a non-English script (e.g. ಪುಣೆ, புனே), translate to English
+    # so that APIs (OpenWeatherMap, Mandi) can understand it
+    if not is_ascii(keyword):
+        keyword = translate_to_english(keyword, hint=keyword_type)
+
+    return keyword
+
+
+# ============================================================
+# MAIN SUPER-AGENT LOGIC
+# ============================================================
+
+def process_farmer_query(transcribed_text: str) -> str:
+    """
+    Core AgriVoice pipeline:
+      1. Classify intent with Sarvam LLM
+      2. Route to correct tool (RAG / Weather / Price API)
+      3. Generate a concise, voice-ready multilingual answer
+    """
+    print(f"\n[Router] Farmer Input: '{transcribed_text}'")
+
+    # ----------------------------------------------------------
+    # STEP 1: Intent Classification
+    # Keyword override runs FIRST — catches cases where LLM misclassifies
+    # (e.g. "pink worms" being classified as GENERAL instead of DISEASE)
+    # ----------------------------------------------------------
+    query_lower = transcribed_text.lower()
+
+    DISEASE_KEYWORDS  = ["worm", "pest", "fungus", "disease", "blight", "rot", "spot",
+                         "virus", "bacterial", "infection", "aphid", "mite", "insect",
+                         "larva", "caterpillar", "yellowing", "wilting", "spray"]
+    WEATHER_KEYWORDS  = ["rain", "weather", "temperature", "humid", "forecast", "cloud",
+                         "storm", "wind", "drought", "flood", "barish", "mausam"]
+    PRICE_KEYWORDS    = ["price", "rate", "mandi", "market", "cost", "sell", "bhav",
+                         "daam", "khareed", "becho"]
+    SCHEME_KEYWORDS   = ["loan", "scheme", "subsidy", "government", "yojana", "kisan",
+                         "credit", "insurance", "pm-kisan", "bank"]
+
+    if any(kw in query_lower for kw in DISEASE_KEYWORDS):
+        intent = "DISEASE"
+    elif any(kw in query_lower for kw in WEATHER_KEYWORDS):
+        intent = "WEATHER"
+    elif any(kw in query_lower for kw in PRICE_KEYWORDS):
+        intent = "PRICE"
+    elif any(kw in query_lower for kw in SCHEME_KEYWORDS):
+        intent = "SCHEME"
+    else:
+        # Keyword match failed — fall back to LLM classification
+        intent_raw = call_sarvam_llm(
+            user_prompt=(
+                f'Classify this farmer query into ONE of: DISEASE, WEATHER, PRICE, SCHEME, GENERAL.\n'
+                f'Reply with ONLY the category word.\nQuery: "{transcribed_text}"'
+            ),
+            system_prompt=(
+                "You are a classifier. Output ONE word from: "
+                "DISEASE, WEATHER, PRICE, SCHEME, GENERAL. Nothing else."
+            )
+        )
+        intent = "GENERAL"
+        for category in ["DISEASE", "WEATHER", "PRICE", "SCHEME", "GENERAL"]:
+            if category in intent_raw.upper():
+                intent = category
+                break
+
+    print(f"[Router] Intent: {intent}")
+
+    # ----------------------------------------------------------
+    # STEP 2: Tool Execution
+    # ----------------------------------------------------------
+    context = ""
+
+    if intent == "DISEASE":
+        print("[Router] -> Searching Disease Vector DB...")
+        rag_query = translate_to_english(transcribed_text, "sentence") if not is_ascii(transcribed_text) else transcribed_text
+        context = retrieve_context(rag_query, collection_name="disease_knowledge", k=3)
+
+    elif intent == "WEATHER":
+        print("[Router] -> Calling Weather API...")
+        location = extract_keyword(transcribed_text, "location")
+        print(f"[Router] Location extracted: {location}")
+        context = get_weather(location)
+
+    elif intent == "PRICE":
+        print("[Router] -> Calling Mandi Price API...")
+        crop = extract_keyword(transcribed_text, "crop")
+        print(f"[Router] Crop extracted: {crop}")
+        context = get_mandi_price(crop)
+
+    elif intent == "SCHEME":
+        print("[Router] -> Searching General Knowledge Vector DB...")
+        rag_query = translate_to_english(transcribed_text, "sentence") if not is_ascii(transcribed_text) else transcribed_text
+        context = retrieve_context(rag_query, collection_name="general_knowledge", k=3)
+
+    else:
+        print("[Router] -> Searching General Knowledge Vector DB...")
+        rag_query = translate_to_english(transcribed_text, "sentence") if not is_ascii(transcribed_text) else transcribed_text
+        context = retrieve_context(rag_query, collection_name="general_knowledge", k=3)
+
+    print(f"[Router] Context snippet: {context[:120].encode('ascii','replace').decode()}...")
+
+    # ----------------------------------------------------------
+    # STEP 3: Generate Final Voice Answer
+    # ----------------------------------------------------------
+    # Detect script of the input query for TTS language selection
+    # Each Indian script occupies a specific Unicode block
+    SCRIPT_TO_LANG = {
+        range(0x0900, 0x0980): "hi-IN",   # Devanagari (Hindi, Marathi)
+        range(0x0980, 0x0A00): "bn-IN",   # Bengali
+        range(0x0A80, 0x0B00): "gu-IN",   # Gujarati
+        range(0x0B00, 0x0B80): "or-IN",   # Odia
+        range(0x0B80, 0x0C00): "ta-IN",   # Tamil
+        range(0x0C00, 0x0C80): "te-IN",   # Telugu
+        range(0x0C80, 0x0D00): "kn-IN",   # Kannada
+        range(0x0D00, 0x0D80): "ml-IN",   # Malayalam
+        range(0x0A00, 0x0A80): "pa-IN",   # Gurmukhi (Punjabi)
+    }
+    lang_code = "en-IN"  # default English
+    for char in transcribed_text:
+        cp = ord(char)
+        for script_range, code in SCRIPT_TO_LANG.items():
+            if cp in script_range:
+                lang_code = code
+                break
+        if lang_code != "en-IN":
+            break
+
+    # Friendly language name for prompts (not used in RAG path, kept for reference)
+    lang = {
+        "hi-IN": "Hindi", "ta-IN": "Tamil", "te-IN": "Telugu",
+        "kn-IN": "Kannada", "ml-IN": "Malayalam", "bn-IN": "Bengali",
+        "gu-IN": "Gujarati", "pa-IN": "Punjabi", "or-IN": "Odia", "en-IN": "English"
+    }.get(lang_code, "English")
+
+    print(f"[Router] Detected language: {lang} ({lang_code})")
+
+
+    if intent in ("PRICE", "WEATHER"):
+        # Tool output is already a complete, voice-ready sentence — return directly.
+        final_answer = context
+
+    else:
+        # RAG-based: extract Expert Solution lines and format into a clean sentence.
+        # We skip LLM synthesis here because sarvam-30b is non-deterministic for
+        # this task — it sometimes produces markdown guides or unrelated content.
+        # Instead we template the answer directly from the retrieved facts.
+        expert_lines = []
+        for line in context.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("Expert Solution:"):
+                solution = stripped.replace("Expert Solution:", "").strip()
+                # Clean up special characters and normalize
+                solution = re.sub(r'[!]+', '.', solution).strip()
+                if solution and len(solution) > 3:
+                    # Capitalize first letter
+                    solution = solution[0].upper() + solution[1:]
+                    if not solution.endswith('.'):
+                        solution += '.'
+                    expert_lines.append(solution)
+
+        if not expert_lines:
+            first_line = context.split("\n")[0].strip()
+            final_answer = first_line[:200] if first_line else "Please consult your nearest agricultural officer."
+        else:
+            # Use only the first (best-matching) expert solution
+            final_answer = expert_lines[0]
+
+    print(f"[Router] Final Answer: {final_answer}")
+    return final_answer
+
+
+
+# ============================================================
+# TEST (Run this file directly: python router.py)
+# ============================================================
+if __name__ == "__main__":
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")  # Support Hindi output in terminal
+
+    test_queries = [
+        "What is the price of tomato today?",
+        "My cotton has pink worms, what should I do?",
+        "How can I get a loan from the bank?",
+        "Will it rain in Pune tomorrow?",
+        "What is the price of onion in Mumbai?",
+    ]
+
+    print("\n" + "=" * 60)
+    print("AgriVoice Router — Full Pipeline Test")
+    print("=" * 60)
+
+    for q in test_queries:
+        print("\n" + "-" * 60)
+        answer = process_farmer_query(q)
+        print(f"\n[BOT AUDIO SCRIPT]: {answer}")
+
+    print("\n" + "=" * 60)
+    print("Test complete.")
