@@ -54,7 +54,7 @@ def detect_language_code(text: str) -> str:
         cp = ord(char)
         for script_range, code in SCRIPT_TO_LANG.items():
             if cp in script_range: return code
-    return "hi-IN"
+    return "en-IN"
 
 def generate_tts_audio(text: str, language_code: str = "hi-IN") -> bytes | None:
     """Fetches high-quality WAV audio from Sarvam Bulbul v2."""
