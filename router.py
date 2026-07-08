@@ -289,6 +289,32 @@ def translate_to_english(text: str, hint: str = "word") -> str:
     return text  # Return original if translation failed
 
 
+def translate_to_indian_language(text: str, target_lang_code: str) -> str:
+    """Uses Sarvam Translate API to translate the English answer into the farmer's language."""
+    if target_lang_code == "en-IN":
+        return text
+
+    url = "https://api.sarvam.ai/translate"
+    headers = {
+        "Content-Type": "application/json",
+        "api-subscription-key": SARVAM_API_KEY
+    }
+    payload = {
+        "input": text,
+        "source_language_code": "en-IN",
+        "target_language_code": target_lang_code
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        if resp.ok:
+            return resp.json().get("translated_text", text)
+        else:
+            print(f"[Translate API Error] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[Translate API Exception] {e}")
+    return text
+
+
 def extract_keyword(query: str, keyword_type: str) -> str:
     """Uses sarvam-30b to extract a location or crop name from the query."""
     if keyword_type == "location":
@@ -485,6 +511,11 @@ def process_farmer_query(transcribed_text: str) -> str:
         else:
             # Use only the first (best-matching) expert solution
             final_answer = expert_lines[0]
+
+    # Translate the answer back to the farmer's language if necessary
+    if lang_code != "en-IN":
+        print(f"[Router] Translating answer to {lang} ({lang_code})...")
+        final_answer = translate_to_indian_language(final_answer, lang_code)
 
     print(f"[Router] Final Answer: {final_answer}")
     return final_answer
