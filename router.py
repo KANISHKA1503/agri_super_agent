@@ -508,30 +508,21 @@ def process_farmer_query(transcribed_text: str) -> str:
         final_answer = context
 
     else:
-        # RAG-based: extract Expert Solution lines and format into a clean sentence.
-        # We skip LLM synthesis here because sarvam-30b is non-deterministic for
-        # this task — it sometimes produces markdown guides or unrelated content.
-        # Instead we template the answer directly from the retrieved facts.
-        expert_lines = []
-        for line in context.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("Expert Solution:"):
-                solution = stripped.replace("Expert Solution:", "").strip()
-                # Clean up special characters and normalize
-                solution = re.sub(r'[!]+', '.', solution).strip()
-                if solution and len(solution) > 3:
-                    # Capitalize first letter
-                    solution = solution[0].upper() + solution[1:]
-                    if not solution.endswith('.'):
-                        solution += '.'
-                    expert_lines.append(solution)
+        # Use LLM to synthesize a natural, voice-ready answer from the RAG context
+        system_prompt = (
+            "You are AgriVoice, a friendly agricultural assistant for Indian farmers. "
+            "Based on the context provided, give a direct, 1-2 sentence final answer that will be spoken out loud over a phone call. "
+            "Do NOT use bullet points, bold text, or markdown formatting. Be polite and helpful. "
+            "If the context doesn't contain the answer, say 'Please consult your nearest agricultural officer.'"
+        )
+        
+        user_prompt = f"Farmer's Question: {english_query}\n\nInformation/Context from database:\n{context}"
+        
+        final_answer = call_sarvam_llm(user_prompt=user_prompt, system_prompt=system_prompt, max_tokens=150)
+        
+        if not final_answer:
+            final_answer = "I'm sorry, I don't have that information right now. Please consult an expert."
 
-        if not expert_lines:
-            first_line = context.split("\n")[0].strip()
-            final_answer = first_line[:200] if first_line else "Please consult your nearest agricultural officer."
-        else:
-            # Use only the first (best-matching) expert solution
-            final_answer = expert_lines[0]
 
     # Translate the answer back to the farmer's language if necessary
     # Enforce a strict 400 character limit BEFORE translation to avoid TTS failure
