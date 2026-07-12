@@ -290,7 +290,7 @@ def translate_to_english(text: str, hint: str = "word") -> str:
 
 
 def translate_to_indian_language(text: str, target_lang_code: str) -> str:
-    """Uses Sarvam Translate API to translate the English answer into the farmer's language."""
+    """Uses Sarvam Translate API to translate the text into the farmer's language."""
     if target_lang_code == "en-IN":
         return text
 
@@ -299,19 +299,38 @@ def translate_to_indian_language(text: str, target_lang_code: str) -> str:
         "Content-Type": "application/json",
         "api-subscription-key": SARVAM_API_KEY
     }
+    # Truncate text to avoid hitting the 500 character limit for TTS later
+    safe_text = text[:400]
+    
     payload = {
-        "input": text,
-        "source_language_code": "en-IN",
+        "input": safe_text,
+        "source_language_code": "auto",  # Auto-detect (RAG sometimes returns Hindi)
         "target_language_code": target_lang_code
     }
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=10)
         if resp.ok:
-            return resp.json().get("translated_text", text)
+            return resp.json().get("translated_text", safe_text)
         else:
             print(f"[Translate API Error] {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"[Translate API Exception] {e}")
+    return safe_text
+
+def translate_to_english_api(text: str, source_lang: str) -> str:
+    """Translates the initial farmer query into English for accurate processing."""
+    url = "https://api.sarvam.ai/translate"
+    payload = {
+        "input": text,
+        "source_language_code": source_lang,
+        "target_language_code": "en-IN"
+    }
+    try:
+        resp = requests.post(url, json=payload, headers={"api-subscription-key": SARVAM_API_KEY}, timeout=10)
+        if resp.ok:
+            return resp.json().get("translated_text", text)
+    except Exception:
+        pass
     return text
 
 
@@ -368,19 +387,55 @@ def process_farmer_query(transcribed_text: str) -> str:
     print(f"\n[Router] Farmer Input: '{transcribed_text}'")
 
     # ----------------------------------------------------------
-    # STEP 1: Intent Classification
-    # Keyword override runs FIRST — catches cases where LLM misclassifies
-    # (e.g. "pink worms" being classified as GENERAL instead of DISEASE)
+    # STEP 1: Language Detection & English Translation
     # ----------------------------------------------------------
-    query_lower = transcribed_text.lower()
+    SCRIPT_TO_LANG = {
+        range(0x0900, 0x0980): "hi-IN",
+        range(0x0980, 0x0A00): "bn-IN",
+        range(0x0A80, 0x0B00): "gu-IN",
+        range(0x0B00, 0x0B80): "or-IN",
+        range(0x0B80, 0x0C00): "ta-IN",
+        range(0x0C00, 0x0C80): "te-IN",
+        range(0x0C80, 0x0D00): "kn-IN",
+        range(0x0D00, 0x0D80): "ml-IN",
+        range(0x0A00, 0x0A80): "pa-IN",
+    }
+    lang_code = "en-IN"
+    for char in transcribed_text:
+        cp = ord(char)
+        for script_range, code in SCRIPT_TO_LANG.items():
+            if cp in script_range:
+                lang_code = code
+                break
+        if lang_code != "en-IN":
+            break
+
+    lang = {
+        "hi-IN": "Hindi", "ta-IN": "Tamil", "te-IN": "Telugu",
+        "kn-IN": "Kannada", "ml-IN": "Malayalam", "bn-IN": "Bengali",
+        "gu-IN": "Gujarati", "pa-IN": "Punjabi", "or-IN": "Odia", "en-IN": "English"
+    }.get(lang_code, "English")
+
+    print(f"[Router] Detected language: {lang} ({lang_code})")
+
+    if lang_code != "en-IN":
+        english_query = translate_to_english_api(transcribed_text, lang_code)
+        print(f"[Router] English Query: '{english_query}'")
+    else:
+        english_query = transcribed_text
+
+    # ----------------------------------------------------------
+    # STEP 2: Intent Classification
+    # Keyword override runs FIRST on the English query
+    # ----------------------------------------------------------
+    query_lower = english_query.lower()
 
     DISEASE_KEYWORDS  = ["worm", "pest", "fungus", "disease", "blight", "rot", "spot",
                          "virus", "bacterial", "infection", "aphid", "mite", "insect",
                          "larva", "caterpillar", "yellowing", "wilting", "spray"]
     WEATHER_KEYWORDS  = ["rain", "weather", "temperature", "humid", "forecast", "cloud",
-                         "storm", "wind", "drought", "flood", "barish", "mausam"]
-    PRICE_KEYWORDS    = ["price", "rate", "mandi", "market", "cost", "sell", "bhav",
-                         "daam", "khareed", "becho"]
+                         "storm", "wind", "drought", "flood"]
+    PRICE_KEYWORDS    = ["price", "rate", "mandi", "market", "cost", "sell"]
     SCHEME_KEYWORDS   = ["loan", "scheme", "subsidy", "government", "yojana", "kisan",
                          "credit", "insurance", "pm-kisan", "bank"]
 
@@ -397,7 +452,7 @@ def process_farmer_query(transcribed_text: str) -> str:
         intent_raw = call_sarvam_llm(
             user_prompt=(
                 f'Classify this farmer query into ONE of: DISEASE, WEATHER, PRICE, SCHEME, GENERAL.\n'
-                f'Reply with ONLY the category word.\nQuery: "{transcribed_text}"'
+                f'Reply with ONLY the category word.\nQuery: "{english_query}"'
             ),
             system_prompt=(
                 "You are a classifier. Output ONE word from: "
@@ -413,73 +468,39 @@ def process_farmer_query(transcribed_text: str) -> str:
     print(f"[Router] Intent: {intent}")
 
     # ----------------------------------------------------------
-    # STEP 2: Tool Execution
+    # STEP 3: Tool Execution
     # ----------------------------------------------------------
     context = ""
 
     if intent == "DISEASE":
         print("[Router] -> Searching Disease Vector DB...")
-        rag_query = translate_to_english(transcribed_text, "sentence") if not is_ascii(transcribed_text) else transcribed_text
-        context = retrieve_context(rag_query, collection_name="disease_knowledge", k=3)
+        context = retrieve_context(english_query, collection_name="disease_knowledge", k=3)
 
     elif intent == "WEATHER":
         print("[Router] -> Calling Weather API...")
-        location = extract_keyword(transcribed_text, "location")
+        location = extract_keyword(english_query, "location")
         print(f"[Router] Location extracted: {location}")
         context = get_weather(location)
 
     elif intent == "PRICE":
         print("[Router] -> Calling Mandi Price API...")
-        crop = extract_keyword(transcribed_text, "crop")
+        crop = extract_keyword(english_query, "crop")
         print(f"[Router] Crop extracted: {crop}")
         context = get_mandi_price(crop)
 
     elif intent == "SCHEME":
         print("[Router] -> Searching General Knowledge Vector DB...")
-        rag_query = translate_to_english(transcribed_text, "sentence") if not is_ascii(transcribed_text) else transcribed_text
-        context = retrieve_context(rag_query, collection_name="general_knowledge", k=3)
+        context = retrieve_context(english_query, collection_name="general_knowledge", k=3)
 
     else:
         print("[Router] -> Searching General Knowledge Vector DB...")
-        rag_query = translate_to_english(transcribed_text, "sentence") if not is_ascii(transcribed_text) else transcribed_text
-        context = retrieve_context(rag_query, collection_name="general_knowledge", k=3)
+        context = retrieve_context(english_query, collection_name="general_knowledge", k=3)
 
     print(f"[Router] Context snippet: {context[:120].encode('ascii','replace').decode()}...")
 
     # ----------------------------------------------------------
-    # STEP 3: Generate Final Voice Answer
+    # STEP 4: Generate Final Voice Answer
     # ----------------------------------------------------------
-    # Detect script of the input query for TTS language selection
-    # Each Indian script occupies a specific Unicode block
-    SCRIPT_TO_LANG = {
-        range(0x0900, 0x0980): "hi-IN",   # Devanagari (Hindi, Marathi)
-        range(0x0980, 0x0A00): "bn-IN",   # Bengali
-        range(0x0A80, 0x0B00): "gu-IN",   # Gujarati
-        range(0x0B00, 0x0B80): "or-IN",   # Odia
-        range(0x0B80, 0x0C00): "ta-IN",   # Tamil
-        range(0x0C00, 0x0C80): "te-IN",   # Telugu
-        range(0x0C80, 0x0D00): "kn-IN",   # Kannada
-        range(0x0D00, 0x0D80): "ml-IN",   # Malayalam
-        range(0x0A00, 0x0A80): "pa-IN",   # Gurmukhi (Punjabi)
-    }
-    lang_code = "en-IN"  # default English
-    for char in transcribed_text:
-        cp = ord(char)
-        for script_range, code in SCRIPT_TO_LANG.items():
-            if cp in script_range:
-                lang_code = code
-                break
-        if lang_code != "en-IN":
-            break
-
-    # Friendly language name for prompts (not used in RAG path, kept for reference)
-    lang = {
-        "hi-IN": "Hindi", "ta-IN": "Tamil", "te-IN": "Telugu",
-        "kn-IN": "Kannada", "ml-IN": "Malayalam", "bn-IN": "Bengali",
-        "gu-IN": "Gujarati", "pa-IN": "Punjabi", "or-IN": "Odia", "en-IN": "English"
-    }.get(lang_code, "English")
-
-    print(f"[Router] Detected language: {lang} ({lang_code})")
 
 
     if intent in ("PRICE", "WEATHER"):
@@ -513,6 +534,9 @@ def process_farmer_query(transcribed_text: str) -> str:
             final_answer = expert_lines[0]
 
     # Translate the answer back to the farmer's language if necessary
+    # Enforce a strict 400 character limit BEFORE translation to avoid TTS failure
+    final_answer = final_answer[:400]
+    
     if lang_code != "en-IN":
         print(f"[Router] Translating answer to {lang} ({lang_code})...")
         final_answer = translate_to_indian_language(final_answer, lang_code)
