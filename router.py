@@ -11,82 +11,52 @@ Architecture:
 import os
 import re
 import requests
+from groq import Groq
 from dotenv import load_dotenv
 from rag_engine import retrieve_context
 
 load_dotenv()
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not SARVAM_API_KEY:
     print("[WARNING] SARVAM_API_KEY not found in .env file!")
+if not GROQ_API_KEY:
+    print("[WARNING] GROQ_API_KEY not found in .env file! Please add it.")
 
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ============================================================
-# CORE LLM CALLER
+# CORE LLM CALLER (Powered by Groq / Llama-3-70B)
 # ============================================================
 
-def call_sarvam_llm(user_prompt: str, system_prompt: str = None, model: str = "sarvam-30b", max_tokens: int = None) -> str:
+def call_llm(user_prompt: str, system_prompt: str = None, model: str = "llama-3.3-70b-versatile", max_tokens: int = 150) -> str:
     """
-    Calls Sarvam's chat completions API.
-    Uses system+user message format to get clean, direct answers.
-    
-    sarvam-30b is a reasoning model. When content=None (reasoning-only response),
-    we extract the final conclusion from reasoning_content.
+    Calls Groq's insanely fast inference API using Llama-3-70B.
+    This provides massive accuracy upgrades over the previous model.
     """
-    url = "https://api.sarvam.ai/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "api-subscription-key": SARVAM_API_KEY,
-    }
+    if not groq_client:
+        print("[LLM ERROR] GROQ_API_KEY is missing!")
+        return ""
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_prompt})
 
-    payload = {"model": model, "messages": messages}
-    if max_tokens:
-        payload["max_tokens"] = max_tokens
-
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-
-        if not response.ok:
-            print(f"[API ERROR] Sarvam returned {response.status_code}: {response.text[:200]}")
-        response.raise_for_status()
-
-        msg = response.json().get("choices", [{}])[0].get("message", {})
-        content = msg.get("content")
-
-        # Good path: model returned content directly
-        if content and content.strip():
+        chat_completion = groq_client.chat.completions.create(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.2, # Low temperature for factual consistency
+        )
+        content = chat_completion.choices[0].message.content
+        if content:
             return content.strip()
-
-        # Fallback: sarvam-30b (reasoning model) sometimes emits None for content
-        # The actual answer is embedded in reasoning_content — find the first valid paragraph
-        reasoning = msg.get("reasoning_content", "") or ""
-        if reasoning.strip():
-            paragraphs = [p.strip() for p in reasoning.split("\n") if p.strip()]
-            # Filter out garbage: markdown headers, short fragments, echoed instructions
-            bad_phrases = [
-                "constraint", "system prompt", "just say", "do not", "don't",
-                "reply with", "one sentence", "reasoning", "instruction", "note:",
-                "step ", "option ", "the prompt", "the user", "the farmer asked",
-            ]
-            valid = [
-                p.strip("*").strip('"').strip()
-                for p in paragraphs
-                if (len(p.strip()) > 20  # not a fragment
-                    and not p.strip().startswith("**")  # not bold header
-                    and not any(kw in p.lower() for kw in bad_phrases))
-            ]
-            if valid:
-                return valid[-1]  # Last valid paragraph = final conclusion
-
         return ""
-
     except Exception as e:
-        print(f"[API EXCEPTION] {e}")
+        print(f"[LLM EXCEPTION] {e}")
         return ""
 
 
@@ -278,7 +248,7 @@ def translate_to_english(text: str, hint: str = "word") -> str:
     if is_ascii(text):
         return text  # Already English, skip API call
 
-    result = call_sarvam_llm(
+    result = call_llm(
         f'Translate this {hint} to English. Reply with ONLY the English word.\n'
         f'Input: "{text}"\nEnglish:'
     )
@@ -343,7 +313,7 @@ def extract_keyword(query: str, keyword_type: str) -> str:
         prompt = f'Extract ONLY the crop/vegetable name from this query. If none, say "Tomato".\nQuery: "{query}"\nCrop:'
         default = "Tomato"
 
-    result = call_sarvam_llm(prompt)
+    result = call_llm(prompt)
     keyword = result.strip().split("\n")[0].strip().strip('"').strip("'").strip(".")
 
     # Strip label prefixes that sarvam-30b sometimes includes e.g. "City: Pune" → "Pune"
@@ -449,7 +419,7 @@ def process_farmer_query(transcribed_text: str) -> str:
         intent = "SCHEME"
     else:
         # Keyword match failed — fall back to LLM classification
-        intent_raw = call_sarvam_llm(
+        intent_raw = call_llm(
             user_prompt=(
                 f'Classify this farmer query into ONE of: DISEASE, WEATHER, PRICE, SCHEME, GENERAL.\n'
                 f'Reply with ONLY the category word.\nQuery: "{english_query}"'
@@ -509,28 +479,41 @@ def process_farmer_query(transcribed_text: str) -> str:
 
     else:
         # Use LLM to synthesize a natural, voice-ready answer from the RAG context
+        # The LLM should USE the context if relevant, but also use its own knowledge
         system_prompt = (
-            "You are AgriVoice, a friendly agricultural assistant for Indian farmers. "
-            "Based on the context provided, give a direct, 1-2 sentence final answer that will be spoken out loud over a phone call. "
-            "Do NOT use bullet points, bold text, or markdown formatting. Be polite and helpful. "
-            "If the context doesn't contain the answer, say 'Please consult your nearest agricultural officer.'"
+            "You are AgriVoice, a friendly agricultural expert for Indian farmers. "
+            "You have deep knowledge about all crops, farming techniques, pest control, soil management, irrigation, government schemes, and organic farming. "
+            "Answer the farmer's question in exactly ONE short sentence that will be spoken over a phone call. "
+            "Use the context provided if it is relevant. If not, use your own knowledge. "
+            "NEVER say 'consult an agricultural officer' or 'I don't have that information'. Always provide a helpful answer. "
+            "No bullet points, bold text, numbers, or markdown. Maximum 40 words."
         )
         
-        user_prompt = f"Farmer's Question: {english_query}\n\nInformation/Context from database:\n{context}"
+        user_prompt = f"Farmer's Question: {english_query}\n\nReference Information:\n{context}"
         
-        final_answer = call_sarvam_llm(user_prompt=user_prompt, system_prompt=system_prompt, max_tokens=150)
+        final_answer = call_llm(user_prompt=user_prompt, system_prompt=system_prompt, max_tokens=120)
         
         if not final_answer:
-            final_answer = "I'm sorry, I don't have that information right now. Please consult an expert."
+            final_answer = "I will look into this for you. Please try asking again in a moment."
 
 
     # Translate the answer back to the farmer's language if necessary
-    # Enforce a strict 400 character limit BEFORE translation to avoid TTS failure
-    final_answer = final_answer[:400]
+    # Enforce a strict 250 character limit BEFORE translation to keep TTS safe
+    final_answer = final_answer[:250]
     
     if lang_code != "en-IN":
         print(f"[Router] Translating answer to {lang} ({lang_code})...")
         final_answer = translate_to_indian_language(final_answer, lang_code)
+
+    # Final safety net: TTS API has a hard 500 char limit
+    if len(final_answer) > 450:
+        # Truncate at the last full stop within 450 chars
+        cut = final_answer[:450]
+        last_period = max(cut.rfind('.'), cut.rfind('।'), cut.rfind('।'))
+        if last_period > 100:
+            final_answer = cut[:last_period + 1]
+        else:
+            final_answer = cut
 
     print(f"[Router] Final Answer: {final_answer}")
     return final_answer

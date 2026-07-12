@@ -254,13 +254,18 @@ async def handle_exotel_stream(websocket: WebSocket):
     playback_task = None
     audio_encoding = "audio/x-l16"
     seq_num_ref = [1]
+    farmer_lang_code = ["en-IN"]  # Track farmer's detected language
+    awaiting_feedback = [False]    # True when waiting for spoken feedback
 
     # VAD State
     audio_buffer = []
     is_speaking = False
     silence_chunks = 0
-    SILENCE_THRESHOLD_RMS = 150  # Adjust if it's too sensitive or not sensitive enough
-    SILENCE_CHUNKS_LIMIT = 15    # Number of silent chunks (approx 1.5 - 2s) to end speech
+    barge_in_counter = 0  # Tracks consecutive loud chunks during playback
+    SILENCE_THRESHOLD_RMS = 150       # RMS threshold for normal speech detection
+    BARGE_IN_THRESHOLD_RMS = 400      # Higher threshold during playback (avoids echo/noise)
+    BARGE_IN_CHUNKS_REQUIRED = 5      # Need 5 consecutive loud chunks (~0.5s) to interrupt
+    SILENCE_CHUNKS_LIMIT = 15         # ~1.5-2s of silence to end speech
 
     async def _process_buffer(pcm_buffer: bytes):
         nonlocal playback_task
@@ -270,16 +275,59 @@ async def handle_exotel_stream(websocket: WebSocket):
         if transcript and len(transcript.strip()) > 2:
             print(f"[SARVAM ASR] [OK] Final Transcript: {transcript}")
             
-            # Barge-in: Interrupt TTS playback if we process new speech
+            # Check if we are waiting for feedback
+            if awaiting_feedback[0]:
+                print(f"[FEEDBACK] Farmer feedback received: '{transcript}'")
+                awaiting_feedback[0] = False
+                # Play a thank-you and end the call
+                from router import translate_to_indian_language
+                goodbye_text = "Thank you for your valuable feedback. Have a great day. Goodbye!"
+                if farmer_lang_code[0] != "en-IN":
+                    goodbye_text = translate_to_indian_language(goodbye_text, farmer_lang_code[0])
+                goodbye_lang = detect_language_code(goodbye_text)
+                try:
+                    goodbye_wav = generate_tts_audio(goodbye_text, language_code=goodbye_lang)
+                    if goodbye_wav:
+                        goodbye_pcm = convert_to_exotel_pcm(goodbye_wav)
+                        chunk_size = 3200
+                        for i in range(0, len(goodbye_pcm), chunk_size):
+                            chunk = goodbye_pcm[i:i + chunk_size]
+                            b64_payload = base64.b64encode(chunk).decode("utf-8")
+                            await websocket.send_json({
+                                "event": "media",
+                                "stream_sid": stream_sid,
+                                "media": {"payload": b64_payload}
+                            })
+                            await asyncio.sleep(0.18)
+                    print("[GOODBYE] Thank-you message sent. Ending call.")
+                except Exception as e:
+                    print(f"[GOODBYE ERROR] {e}")
+                
+                # Wait for the goodbye audio to actually finish playing on the phone line
+                # 8kHz 16-bit mono = 16000 bytes per second
+                audio_duration = len(goodbye_pcm) / 16000 if 'goodbye_pcm' in locals() else 3
+                await asyncio.sleep(audio_duration + 0.5)  # Add 0.5s buffer
+                
+                # Close the WebSocket to end the call
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+                return
+            
+            # Normal flow: Barge-in and process query
             if playback_task and not playback_task.done():
                 print("[BARGE-IN] Interrupting current playback...")
                 playback_task.cancel()
                 if stream_sid:
-                    await websocket.send_json({"event": "clear", "stream_sid": stream_sid})
+                    try:
+                        await websocket.send_json({"event": "clear", "stream_sid": stream_sid})
+                    except Exception:
+                        pass
                     
             # Process query and play answer
             playback_task = asyncio.create_task(
-                process_and_play(transcript, websocket, stream_sid, seq_num_ref)
+                process_and_play(transcript, websocket, stream_sid, seq_num_ref, farmer_lang_code)
             )
         else:
             print("[SARVAM ASR] No speech recognized.")
@@ -314,19 +362,37 @@ async def handle_exotel_stream(websocket: WebSocket):
                     if len(arr) > 0:
                         rms = float(np.sqrt(np.mean(np.square(arr.astype(np.float32)))))
                         
-                        if rms > SILENCE_THRESHOLD_RMS:
-                            if not is_speaking:
-                                print("[VAD] 🎤 Speech detected, starting buffer...")
-                                # Barge-in: if bot is playing, interrupt immediately when farmer speaks
-                                if playback_task and not playback_task.done():
-                                    print("[BARGE-IN] Farmer spoke! Interrupting current playback...")
+                        # Check if bot is currently playing audio back
+                        bot_is_playing = playback_task and not playback_task.done()
+                        
+                        # Use a HIGHER threshold during playback to avoid echo/noise triggers
+                        current_threshold = BARGE_IN_THRESHOLD_RMS if bot_is_playing else SILENCE_THRESHOLD_RMS
+                        
+                        if rms > current_threshold:
+                            if bot_is_playing:
+                                # During playback: require SUSTAINED loud speech before interrupting
+                                barge_in_counter += 1
+                                if barge_in_counter >= BARGE_IN_CHUNKS_REQUIRED:
+                                    print("[BARGE-IN] Farmer is speaking! Interrupting playback...")
                                     playback_task.cancel()
-                                    await websocket.send_json({"event": "clear", "stream_sid": stream_sid})
-                                    
-                            is_speaking = True
-                            silence_chunks = 0
-                            audio_buffer.append(pcm_bytes)
+                                    try:
+                                        await websocket.send_json({"event": "clear", "stream_sid": stream_sid})
+                                    except Exception:
+                                        pass
+                                    barge_in_counter = 0
+                                    is_speaking = True
+                                    silence_chunks = 0
+                                    audio_buffer.append(pcm_bytes)
+                            else:
+                                # Not playing: normal VAD behavior
+                                if not is_speaking:
+                                    print("[VAD] 🎤 Speech detected, starting buffer...")
+                                is_speaking = True
+                                silence_chunks = 0
+                                barge_in_counter = 0
+                                audio_buffer.append(pcm_bytes)
                         else:
+                            barge_in_counter = 0  # Reset barge-in counter on silence
                             if is_speaking:
                                 audio_buffer.append(pcm_bytes)
                                 silence_chunks += 1
@@ -342,7 +408,44 @@ async def handle_exotel_stream(websocket: WebSocket):
 
             elif event == "dtmf":
                 digit = data.get("dtmf", {}).get("digit")
-                print(f"[EXOTEL STREAM] [DTMF] DTMF Digit: {digit}")
+                print(f"[EXOTEL STREAM] [DTMF] Digit pressed: {digit}")
+                # Farmer pressed a key to end the call
+                if playback_task and not playback_task.done():
+                    playback_task.cancel()
+                
+                # Ask for feedback in the farmer's native language
+                print("[FEEDBACK] Asking farmer for feedback...")
+                from router import translate_to_indian_language
+                feedback_prompt = "Thank you for using AgriVoice! Before you go, please tell us how was your experience? Your feedback helps us improve."
+                if farmer_lang_code[0] != "en-IN":
+                    feedback_prompt = translate_to_indian_language(feedback_prompt, farmer_lang_code[0])
+                
+                async def play_feedback():
+                    try:
+                        feedback_lang = detect_language_code(feedback_prompt)
+                        feedback_wav = generate_tts_audio(feedback_prompt, language_code=feedback_lang)
+                        if feedback_wav:
+                            feedback_pcm = convert_to_exotel_pcm(feedback_wav)
+                            chunk_size = 3200
+                            for i in range(0, len(feedback_pcm), chunk_size):
+                                chunk = feedback_pcm[i:i + chunk_size]
+                                b64_payload = base64.b64encode(chunk).decode("utf-8")
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "stream_sid": stream_sid,
+                                    "media": {"payload": b64_payload}
+                                })
+                                await asyncio.sleep(0.18)
+                        print("[FEEDBACK] Feedback prompt sent. Waiting for farmer's response...")
+                    except asyncio.CancelledError:
+                        print("[FEEDBACK] Prompt cancelled by barge-in.")
+                    except Exception as e:
+                        print(f"[FEEDBACK ERROR] {e}")
+
+                # Run the feedback prompt in the background so we can listen to the farmer immediately
+                playback_task = asyncio.create_task(play_feedback())
+                # Set the flag so the next VAD capture is treated as feedback
+                awaiting_feedback[0] = True
 
             elif event == "stop":
                 print("[EXOTEL STREAM] Received 'stop' event. Terminating stream.")
@@ -359,7 +462,7 @@ async def handle_exotel_stream(websocket: WebSocket):
         print("[EXOTEL STREAM] Session ended.\n")
 
 
-async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: str, seq_ref: list):
+async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: str, seq_ref: list, farmer_lang_ref: list = None):
     """
     Passes transcript to the router, generates TTS, transcodes to 8kHz PCM,
     and streams back to Exotel in chunks.
@@ -372,6 +475,11 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
 
         # 2. Text to Speech
         lang_code = detect_language_code(answer)
+        
+        # Track the farmer's language for future use (feedback/goodbye)
+        if farmer_lang_ref and lang_code != "en-IN":
+            farmer_lang_ref[0] = lang_code
+        
         wav_audio = generate_tts_audio(answer, language_code=lang_code)
 
         if not wav_audio:
@@ -382,9 +490,6 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         pcm_data = convert_to_exotel_pcm(wav_audio)
 
         # 4. Stream back to Exotel in chunks
-        # Exotel recommends chunks representing 100-200ms.
-        # At 8000Hz, 16-bit Mono: 1 second = 16000 bytes.
-        # Let's chunk by 3200 bytes (200ms).
         chunk_size = 3200
         
         print(f"[PLAYBACK] Streaming {len(pcm_data)} bytes of PCM back to Exotel...")
@@ -392,8 +497,6 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         for i in range(0, len(pcm_data), chunk_size):
             chunk = pcm_data[i:i + chunk_size]
             b64_payload = base64.b64encode(chunk).decode("utf-8")
-            chunk_idx = int(i / chunk_size) + 1
-            timestamp_ms = int((i / chunk_size) * 200)
             
             await websocket.send_json({
                 "event": "media",
@@ -403,10 +506,28 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
                 }
             })
             
-            # Sleep slightly faster than real-time to maintain an active buffer in Exotel
             await asyncio.sleep(0.18)
 
         print("[PLAYBACK] [OK] Streaming complete.")
+
+        # After answering, play a suffix in the farmer's native language
+        from router import translate_to_indian_language
+        suffix_text = "You can ask me another question, or press any number on your phone to end the call."
+        if farmer_lang_ref and farmer_lang_ref[0] != "en-IN":
+            suffix_text = translate_to_indian_language(suffix_text, farmer_lang_ref[0])
+        suffix_lang = detect_language_code(suffix_text)
+        suffix_wav = generate_tts_audio(suffix_text, language_code=suffix_lang)
+        if suffix_wav:
+            suffix_pcm = convert_to_exotel_pcm(suffix_wav)
+            for i in range(0, len(suffix_pcm), chunk_size):
+                chunk = suffix_pcm[i:i + chunk_size]
+                b64_payload = base64.b64encode(chunk).decode("utf-8")
+                await websocket.send_json({
+                    "event": "media",
+                    "stream_sid": stream_sid,
+                    "media": {"payload": b64_payload}
+                })
+                await asyncio.sleep(0.18)
 
     except asyncio.CancelledError:
         print("[PLAYBACK] [STOP] Playback task was cancelled (Barge-in occurred).")
