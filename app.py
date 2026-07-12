@@ -113,6 +113,40 @@ def convert_to_exotel_pcm(audio_bytes: bytes) -> bytes:
 
 
 # ============================================================
+# SARVAM ASR (REST API)
+# ============================================================
+
+def transcribe_audio_rest(pcm_bytes: bytes) -> str:
+    """Sends recorded 8kHz PCM audio to Sarvam ASR REST API."""
+    if not pcm_bytes:
+        return ""
+        
+    import wave
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(pcm_bytes)
+    wav_io.seek(0)
+    
+    try:
+        resp = requests.post(
+            "https://api.sarvam.ai/speech-to-text",
+            headers={"api-subscription-key": SARVAM_API_KEY},
+            files={"file": ("audio.wav", wav_io, "audio/wav")},
+            data={"model": "saaras:v3"},
+            timeout=10
+        )
+        if resp.ok:
+            return resp.json().get("transcript", "").strip()
+        else:
+            print(f"[ASR Error] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[ASR Exception] {e}")
+    return ""
+
+# ============================================================
 # GREETING & AUDIO HELPERS
 # ============================================================
 
@@ -148,17 +182,10 @@ async def send_greeting(websocket: WebSocket, sid: str, seq_ref: list):
             chunk_idx = int(i / chunk_size) + 1
             timestamp_ms = int((i / chunk_size) * 200)
             
-            # Fetch current sequence number and increment it
-            current_seq = seq_ref[0]
-            seq_ref[0] += 1
-            
             await websocket.send_json({
                 "event": "media",
-                "sequence_number": current_seq,
                 "stream_sid": sid,
                 "media": {
-                    "chunk": chunk_idx,
-                    "timestamp": str(timestamp_ms),
                     "payload": b64_payload
                 }
             })
@@ -166,7 +193,9 @@ async def send_greeting(websocket: WebSocket, sid: str, seq_ref: list):
 
         print("[GREETING] [OK] Welcome message sent.")
     except Exception as e:
-        print(f"[GREETING ERROR] {e}")
+        # Ignore socket closed exceptions if Exotel hung up
+        if "socket.send() raised exception" not in str(e):
+            print(f"[GREETING ERROR] {e}")
 
 
 def decode_exotel_audio(raw_bytes: bytes, encoding: str) -> bytes:
@@ -206,11 +235,13 @@ async def debug_status():
 # ============================================================
 # EXOTEL AGENTSTREAM WEBSOCKET
 # ============================================================
+import numpy as np
 
 @app.websocket("/exotel-stream")
 async def handle_exotel_stream(websocket: WebSocket):
     """
     Main WebSocket bridge between Exotel AgentStream and our bot logic.
+    Uses Voice Activity Detection (VAD) to buffer audio and send to REST API.
     """
     await websocket.accept()
     print("\n" + "=" * 60)
@@ -220,81 +251,42 @@ async def handle_exotel_stream(websocket: WebSocket):
     # Session State
     stream_sid = None
     call_sid = None
-    sarvam_ws = None
-    playback_task = None  # To manage barge-in interruptions
-    audio_encoding = "audio/x-l16"  # Default; updated from Exotel 'start' event
-    seq_num_ref = [1]  # Mutable list to share sequence number count across tasks
+    playback_task = None
+    audio_encoding = "audio/x-l16"
+    seq_num_ref = [1]
+
+    # VAD State
+    audio_buffer = []
+    is_speaking = False
+    silence_chunks = 0
+    SILENCE_THRESHOLD_RMS = 150  # Adjust if it's too sensitive or not sensitive enough
+    SILENCE_CHUNKS_LIMIT = 15    # Number of silent chunks (approx 1.5 - 2s) to end speech
+
+    async def _process_buffer(pcm_buffer: bytes):
+        nonlocal playback_task
+        print("[VAD] 🛑 Silence detected, processing speech...")
+        transcript = await asyncio.to_thread(transcribe_audio_rest, pcm_buffer)
+        
+        if transcript and len(transcript.strip()) > 2:
+            print(f"[SARVAM ASR] [OK] Final Transcript: {transcript}")
+            
+            # Barge-in: Interrupt TTS playback if we process new speech
+            if playback_task and not playback_task.done():
+                print("[BARGE-IN] Interrupting current playback...")
+                playback_task.cancel()
+                if stream_sid:
+                    await websocket.send_json({"event": "clear", "stream_sid": stream_sid})
+                    
+            # Process query and play answer
+            playback_task = asyncio.create_task(
+                process_and_play(transcript, websocket, stream_sid, seq_num_ref)
+            )
+        else:
+            print("[SARVAM ASR] No speech recognized.")
 
     try:
-        # 1. Connect to Sarvam ASR WebSocket
-        print("[SARVAM STREAM] Connecting to Saaras ASR...")
-        # language-code and model must be specified in the query parameters for the connection handshake
-        sarvam_uri = f"wss://api.sarvam.ai/speech-to-text/ws?language-code=ta-IN&model=saaras:v3"
-        sarvam_ws = await websockets.connect(
-            sarvam_uri, 
-            additional_headers={"api-subscription-key": SARVAM_API_KEY}
-        )
-        print("[SARVAM STREAM] [OK] Connected to ASR")
-
-        # Send initialization config to Sarvam ASR
-        config_payload = {
-            "type": "config",
-            "data": {
-                "model": "saaras:v3",
-                "language_code": "ta-IN",
-                "sampling_rate": 8000,
-                "encoding": "pcm_s16le"
-            }
-        }
-        print("[SARVAM DEBUG] Config:", json.dumps(config_payload))
-        await sarvam_ws.send(json.dumps(config_payload))
-        print("[SARVAM STREAM] Sent configuration payload.")
-
-        # 2. Start Sarvam Receiver Task
-        # Listens for transcripts coming back from Sarvam
-        async def sarvam_receiver():
-            nonlocal playback_task
-            try:
-                async for message in sarvam_ws:
-                    # Sarvam sends JSON responses containing transcripts
-                    data = json.loads(message)
-                    transcript = data.get("transcript", "")
-                    is_final = data.get("is_final", False)
-
-                    if transcript:
-                        print(f"[SARVAM ASR] Incoming: {transcript}")
-                    
-                    if transcript and is_final and len(transcript.strip()) > 2:
-                        print(f"[SARVAM ASR] [OK] Final Transcript: {transcript}")
-                        
-                        # BARGE-IN: If TTS is currently playing, interrupt it!
-                        if playback_task and not playback_task.done():
-                            print("[BARGE-IN] Interrupting current playback...")
-                            playback_task.cancel()
-                            
-                            # Send Exotel clear event to flush their playback buffer
-                            if stream_sid:
-                                await websocket.send_json({
-                                    "event": "clear",
-                                    "stream_sid": stream_sid
-                                })
-                                print("[EXOTEL STREAM] Sent 'clear' event.")
-                        
-                        # Process the new query and play the answer
-                        playback_task = asyncio.create_task(
-                            process_and_play(transcript, websocket, stream_sid, seq_num_ref)
-                        )
-            except websockets.exceptions.ConnectionClosed:
-                print("[SARVAM STREAM] [ERR] Connection closed")
-            except Exception as e:
-                print(f"[SARVAM ERROR] {e}")
-
-        sarvam_task = asyncio.create_task(sarvam_receiver())
-
-        # 3. Listen to Exotel AgentStream
         while True:
             data = await websocket.receive_json()
-            print(f"[EXOTEL RAW EVENT] {data}")
             event = data.get("event")
 
             if event == "connected":
@@ -304,28 +296,49 @@ async def handle_exotel_stream(websocket: WebSocket):
                 start_data = data.get("start", {})
                 stream_sid = start_data.get("stream_sid")
                 call_sid = start_data.get("call_sid")
-                # Read the audio encoding format sent by Exotel
                 media_format = start_data.get("media_format", {})
                 audio_encoding = media_format.get("encoding", "audio/x-l16")
                 print(f"[EXOTEL STREAM] 'start' | Stream: {stream_sid} | Call: {call_sid} | Encoding: {audio_encoding}")
 
-                # ── Send greeting immediately to keep the call alive ──
+                # Send greeting immediately to keep the call alive
                 asyncio.create_task(send_greeting(websocket, stream_sid, seq_num_ref))
 
             elif event == "media":
-                # Exotel sends Base64-encoded audio chunks (PCM or mulaw)
                 payload = data.get("media", {}).get("payload")
-                if payload and sarvam_ws:
+                if payload:
                     raw_bytes = base64.b64decode(payload)
-                    # Decode to PCM if Exotel is sending mulaw-encoded audio
                     pcm_bytes = decode_exotel_audio(raw_bytes, audio_encoding)
-                    try:
-                        await sarvam_ws.send(pcm_bytes)
-                    except websockets.exceptions.ConnectionClosed:
-                        print("[SARVAM SEND] [WARN] ASR WebSocket closed, stopping audio forward.")
-                        sarvam_ws = None  # Prevent further send attempts
-                    except Exception as e:
-                        print(f"[SARVAM SEND ERROR] {e}")
+                    
+                    # Voice Activity Detection (VAD) via RMS volume
+                    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+                    if len(arr) > 0:
+                        rms = float(np.sqrt(np.mean(np.square(arr.astype(np.float32)))))
+                        
+                        if rms > SILENCE_THRESHOLD_RMS:
+                            if not is_speaking:
+                                print("[VAD] 🎤 Speech detected, starting buffer...")
+                                # Barge-in: if bot is playing, interrupt immediately when farmer speaks
+                                if playback_task and not playback_task.done():
+                                    print("[BARGE-IN] Farmer spoke! Interrupting current playback...")
+                                    playback_task.cancel()
+                                    await websocket.send_json({"event": "clear", "stream_sid": stream_sid})
+                                    
+                            is_speaking = True
+                            silence_chunks = 0
+                            audio_buffer.append(pcm_bytes)
+                        else:
+                            if is_speaking:
+                                audio_buffer.append(pcm_bytes)
+                                silence_chunks += 1
+                                if silence_chunks >= SILENCE_CHUNKS_LIMIT:
+                                    final_audio = b"".join(audio_buffer)
+                                    audio_buffer = []
+                                    is_speaking = False
+                                    silence_chunks = 0
+                                    
+                                    # Process if it's long enough (avoid short noise blips)
+                                    if len(final_audio) > 8000: # at least ~0.5 second of audio
+                                        asyncio.create_task(_process_buffer(final_audio))
 
             elif event == "dtmf":
                 digit = data.get("dtmf", {}).get("digit")
@@ -341,13 +354,6 @@ async def handle_exotel_stream(websocket: WebSocket):
         print(f"[STREAM ERROR] {e}")
         traceback.print_exc()
     finally:
-        # Cleanup connections
-        if sarvam_ws:
-            try:
-                await sarvam_ws.close()
-                print("[SARVAM STREAM] Closed ASR connection.")
-            except Exception:
-                pass
         if playback_task and not playback_task.done():
             playback_task.cancel()
         print("[EXOTEL STREAM] Session ended.\n")
@@ -389,17 +395,10 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
             chunk_idx = int(i / chunk_size) + 1
             timestamp_ms = int((i / chunk_size) * 200)
             
-            # Fetch current sequence number and increment it
-            current_seq = seq_ref[0]
-            seq_ref[0] += 1
-            
             await websocket.send_json({
                 "event": "media",
-                "sequence_number": current_seq,
                 "stream_sid": stream_sid,
                 "media": {
-                    "chunk": chunk_idx,
-                    "timestamp": str(timestamp_ms),
                     "payload": b64_payload
                 }
             })
