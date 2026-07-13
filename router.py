@@ -516,7 +516,7 @@ def process_farmer_query(transcribed_text: str) -> str:
             final_answer = cut
 
     print(f"[Router] Final Answer: {final_answer}")
-    return final_answer
+    return final_answer, intent
 
 
 
@@ -541,8 +541,9 @@ if __name__ == "__main__":
 
     for q in test_queries:
         print("\n" + "-" * 60)
-        answer = process_farmer_query(q)
-        print(f"\n[BOT AUDIO SCRIPT]: {answer}")
+        answer, intent = process_farmer_query(q)
+        print(f"\n[INTENT DETECTED]: {intent}")
+        print(f"[BOT AUDIO SCRIPT]: {answer}")
 
     print("\n" + "=" * 60)
     print("Test complete.")
