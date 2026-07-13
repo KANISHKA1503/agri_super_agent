@@ -481,7 +481,7 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
     try:
         # 1. Routing
         print("[ROUTER] Analyzing farmer query...")
-        answer, intent = process_farmer_query(transcript)
+        answer, intent, english_query, english_answer = process_farmer_query(transcript)
         print(f"[ROUTER] [OK] Answer: {answer}")
 
         # 2. Text to Speech
@@ -522,7 +522,7 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         print("[PLAYBACK] [OK] Streaming complete.")
         
         # 5. Push to Base44 Database
-        asyncio.create_task(push_to_base44(stream_sid, transcript, answer, lang_code, intent))
+        asyncio.create_task(push_to_base44(stream_sid, transcript, answer, lang_code, intent, english_query, english_answer))
 
         # After answering, play a suffix in the farmer's native language
         from router import translate_to_indian_language
@@ -549,7 +549,7 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         print(f"[PLAYBACK ERROR] {e}")
         traceback.print_exc()
 
-async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent: str = "General"):
+async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent: str = "General", english_query: str = "", english_answer: str = ""):
     """Pushes the completed call to the Base44 database webhook."""
     # We load these from the .env file so the API key stays secret
     base44_url = os.getenv("BASE44_API_URL")
@@ -608,6 +608,8 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             "location_mentioned": meta.get("location", ""),
             "disease_mentioned": meta.get("disease", ""),
             "scheme_mentioned": meta.get("scheme", ""),
+            "farmer_query_english": english_query,
+            "ai_response_english": english_answer,
             "unanswered_reason": ""
         }
         

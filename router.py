@@ -499,7 +499,8 @@ def process_farmer_query(transcribed_text: str) -> str:
 
     # Translate the answer back to the farmer's language if necessary
     # Enforce a strict 250 character limit BEFORE translation to keep TTS safe
-    final_answer = final_answer[:250]
+    english_answer = final_answer[:250]
+    final_answer = english_answer
     
     if lang_code != "en-IN":
         print(f"[Router] Translating answer to {lang} ({lang_code})...")
@@ -516,7 +517,7 @@ def process_farmer_query(transcribed_text: str) -> str:
             final_answer = cut
 
     print(f"[Router] Final Answer: {final_answer}")
-    return final_answer, intent
+    return final_answer, intent, english_query, english_answer
 
 
 
@@ -541,7 +542,7 @@ if __name__ == "__main__":
 
     for q in test_queries:
         print("\n" + "-" * 60)
-        answer, intent = process_farmer_query(q)
+        answer, intent, eq, ea = process_farmer_query(q)
         print(f"\n[INTENT DETECTED]: {intent}")
         print(f"[BOT AUDIO SCRIPT]: {answer}")
 
