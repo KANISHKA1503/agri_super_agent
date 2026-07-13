@@ -603,10 +603,10 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
         if "i will look into this" in ans_lower:
             status = "unanswered"
             unanswered_reason = "Knowledge Gap (LLM Failure)"
-        elif "could not fetch the weather" in ans_lower:
+        elif "temporarily unavailable" in ans_lower and "weather" in ans_lower:
             status = "unanswered"
             unanswered_reason = "Weather API Failure"
-        elif "could not find the current price" in ans_lower:
+        elif "price data for" in ans_lower and "is not available right now" in ans_lower:
             status = "unanswered"
             unanswered_reason = "Market Price Database Gap"
 
