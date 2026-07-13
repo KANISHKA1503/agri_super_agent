@@ -48,7 +48,17 @@ load_dotenv()
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 EXOTEL_ACCOUNT_SID = os.getenv("EXOTEL_ACCOUNT_SID")
 
-app = FastAPI(title="AgriVoice Super-Agent (AgentStream)", version="2.0")
+app = FastAPI(title="AgriVoice Super-Agent (AgentStream)", version="3.0")
+
+# CORS — Allow Base44 frontend and any origin to call our API
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================
 # SARVAM TTS & LANGUAGE HELPERS
@@ -509,6 +519,9 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
             await asyncio.sleep(0.18)
 
         print("[PLAYBACK] [OK] Streaming complete.")
+        
+        # 5. Push to Base44 Database
+        asyncio.create_task(push_to_base44(stream_sid, answer, lang_code))
 
         # After answering, play a suffix in the farmer's native language
         from router import translate_to_indian_language
@@ -534,6 +547,42 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
     except Exception as e:
         print(f"[PLAYBACK ERROR] {e}")
         traceback.print_exc()
+
+async def push_to_base44(phone: str, answer: str, lang: str):
+    """Pushes the completed call to the Base44 database webhook."""
+    # We load these from the .env file so the API key stays secret
+    base44_url = os.getenv("BASE44_API_URL")
+    base44_key = os.getenv("BASE44_API_KEY")
+    
+    if not base44_url or not base44_key:
+        print("[BASE44] Skipping DB insert — BASE44_API_URL or KEY not found in .env")
+        return
+        
+    try:
+        payload = {
+            "phone_number": "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": 45,  # Estimated for now
+            "language_detected": lang,
+            "category": "General",   # We can extract intent later
+            "farmer_query": "Farmer's query via phone",
+            "ai_response": answer,
+            "status": "answered",
+            "crop_mentioned": "",
+            "location_mentioned": "",
+            "unanswered_reason": ""
+        }
+        
+        import requests
+        resp = await asyncio.to_thread(
+            requests.post, 
+            base44_url, 
+            json=payload, 
+            headers={"x-api-key": base44_key, "Content-Type": "application/json"}
+        )
+        print(f"[BASE44] ✅ Call logged to Base44! Status: {resp.status_code}")
+    except Exception as e:
+        print(f"[BASE44] ❌ Error pushing to DB: {e}")
 
 
 # ============================================================
@@ -623,6 +672,9 @@ async def health():
             "/api/disease-advice": "Get disease advice (POST)",
             "/api/scheme-info": "Get scheme info (POST)",
             "/api/query": "General query (POST)",
+            "/api/call-logs": "Get call logs (GET)",
+            "/api/stats": "Get dashboard stats (GET)",
+            "/api/log-call": "Log a completed call (POST)",
         },
         "powered_by": {
             "llm": "Sarvam sarvam-m4",
@@ -632,3 +684,76 @@ async def health():
         },
     }
 
+
+# ============================================================
+# CALL LOG STORAGE (in-memory for hackathon, swap to MongoDB later)
+# ============================================================
+from datetime import datetime, timezone
+from collections import Counter
+
+call_logs = []  # In-memory store — replace with MongoDB for production
+
+
+@app.post("/api/log-call")
+async def log_call(request):
+    """Log a completed call. Called by the Exotel stream handler or manually."""
+    body = await request.json()
+    entry = {
+        "id": len(call_logs) + 1,
+        "timestamp": body.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        "phone_number": body.get("phone_number", "+91 ****0000"),
+        "duration_seconds": body.get("duration_seconds", 0),
+        "language": body.get("language", "English"),
+        "category": body.get("category", "General"),
+        "farmer_query": body.get("farmer_query", ""),
+        "ai_response": body.get("ai_response", ""),
+        "status": body.get("status", "answered"),
+        "crop_mentioned": body.get("crop_mentioned", ""),
+        "location_mentioned": body.get("location_mentioned", ""),
+    }
+    call_logs.append(entry)
+    print(f"[LOG] Call #{entry['id']} logged: {entry['category']} - {entry['farmer_query'][:50]}")
+    return {"success": True, "id": entry["id"]}
+
+
+@app.get("/api/call-logs")
+async def get_call_logs():
+    """Return all call logs (newest first) for the dashboard."""
+    return {"logs": list(reversed(call_logs)), "total": len(call_logs)}
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Return dashboard stats computed from call logs."""
+    total = len(call_logs)
+    if total == 0:
+        return {
+            "total_calls": 0,
+            "answered": 0,
+            "unanswered": 0,
+            "avg_duration": 0,
+            "category_distribution": {},
+            "language_distribution": {},
+            "top_crops": [],
+            "top_locations": [],
+        }
+
+    answered = sum(1 for c in call_logs if c["status"] == "answered")
+    unanswered = total - answered
+    avg_dur = sum(c["duration_seconds"] for c in call_logs) / total
+
+    cats = Counter(c["category"] for c in call_logs)
+    langs = Counter(c["language"] for c in call_logs)
+    crops = Counter(c["crop_mentioned"] for c in call_logs if c["crop_mentioned"])
+    locs = Counter(c["location_mentioned"] for c in call_logs if c["location_mentioned"])
+
+    return {
+        "total_calls": total,
+        "answered": answered,
+        "unanswered": unanswered,
+        "avg_duration": round(avg_dur, 1),
+        "category_distribution": dict(cats),
+        "language_distribution": dict(langs),
+        "top_crops": crops.most_common(10),
+        "top_locations": locs.most_common(10),
+    }
