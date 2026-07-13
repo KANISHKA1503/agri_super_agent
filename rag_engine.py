@@ -4,8 +4,15 @@ from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# Initialize the embedding model (This runs locally and is free)
-embedding_function = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# Lazily initialize the embedding model so it doesn't block server startup
+embedding_function = None
+
+def get_embedding_function():
+    global embedding_function
+    if embedding_function is None:
+        print("[RAG] Initializing HuggingFaceEmbeddings (this might take a moment)...")
+        embedding_function = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return embedding_function
 
 # Define where to save the database
 DB_DIR = "./vector_db"
@@ -33,7 +40,7 @@ def add_documents_in_batches(docs, collection_name, batch_size=5000):
     first_batch = docs[:batch_size]
     db = Chroma.from_documents(
         first_batch,
-        embedding_function,
+        get_embedding_function(),
         persist_directory=DB_DIR,
         collection_name=collection_name
     )
@@ -111,7 +118,7 @@ def retrieve_context(user_query: str, collection_name: str, k: int = 3) -> str:
     try:
         db = Chroma(
             persist_directory=DB_DIR,
-            embedding_function=embedding_function,
+            embedding_function=get_embedding_function(),
             collection_name=collection_name
         )
 
