@@ -618,10 +618,10 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
         # Determine the final phone number to display
         # If 'phone' looks like a UUID (stream_sid), and we have a DEMO_PHONE_NUMBER, use the demo number
         if len(phone) > 15 and demo_phone:
-            display_phone = demo_phone
+            display_phone = "+91 ****" + str(demo_phone)[-4:]
         elif phone and len(phone) <= 15:
             # It's a real phone number extracted from URL/custom_data
-            display_phone = "+91 ****" + str(phone)[-4:] if not str(phone).startswith("+") else phone
+            display_phone = "+91 ****" + str(phone)[-4:]
         else:
             # Fallback to UUID masking
             display_phone = "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000"
