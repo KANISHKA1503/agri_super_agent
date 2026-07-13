@@ -565,7 +565,7 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
         import json
         
         prompt = (
-            f"Analyze this farmer query: '{query}'\n"
+            f"Analyze this farmer query: '{english_query}'\n"
             "Extract any mentioned crop, location, disease/pest, or government scheme.\n"
             "Respond ONLY with a valid JSON object using exactly these keys: 'crop', 'location', 'disease', 'scheme'.\n"
             "If a piece of information is not mentioned, use an empty string as the value. Do not add markdown or comments."
