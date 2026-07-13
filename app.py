@@ -585,19 +585,27 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             print(f"[BASE44] Extractor failed/parsing error: {e}")
             meta = {"crop": "", "location": "", "disease": "", "scheme": ""}
 
+        # Map router intents to the exact category strings expected by Base44 schema
+        cat_map = {
+            "DISEASE": "Crop Disease",
+            "WEATHER": "Weather",
+            "PRICE": "Market Price",
+            "SCHEME": "Government Scheme",
+            "GENERAL": "General"
+        }
+        mapped_category = cat_map.get(intent.upper(), "General")
+
         payload = {
             "phone_number": "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "duration_seconds": 45,  # Estimated for now
             "language_detected": lang,
-            "category": intent,
+            "category": mapped_category,
             "farmer_query": query,
             "ai_response": answer,
             "status": "answered",
             "crop_mentioned": meta.get("crop", ""),
             "location_mentioned": meta.get("location", ""),
-            "disease_mentioned": meta.get("disease", ""),
-            "scheme_mentioned": meta.get("scheme", ""),
             "unanswered_reason": ""
         }
         
@@ -606,7 +614,7 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             requests.post, 
             base44_url, 
             json=payload, 
-            headers={"x-api-key": base44_key, "Content-Type": "application/json"}
+            headers={"Authorization": f"Bearer {base44_key}", "Content-Type": "application/json"}
         )
         print(f"[BASE44] ✅ Call logged to Base44! Status: {resp.status_code}")
     except Exception as e:
