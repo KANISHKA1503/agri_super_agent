@@ -276,7 +276,7 @@ async def handle_exotel_stream(websocket: WebSocket):
     SILENCE_THRESHOLD_RMS = 150       # RMS threshold for normal speech detection
     BARGE_IN_THRESHOLD_RMS = 400      # Higher threshold during playback (avoids echo/noise)
     BARGE_IN_CHUNKS_REQUIRED = 5      # Need 5 consecutive loud chunks (~0.5s) to interrupt
-    SILENCE_CHUNKS_LIMIT = 15         # ~1.5-2s of silence to end speech
+    SILENCE_CHUNKS_LIMIT = 8          # ~0.8s of silence to end speech (reduced for faster response)
 
     async def _process_buffer(pcm_buffer: bytes):
         nonlocal playback_task
@@ -614,9 +614,12 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             requests.post, 
             base44_url, 
             json=payload, 
-            headers={"Authorization": f"Bearer {base44_key}", "Content-Type": "application/json"}
+            headers={"x-api-key": base44_key, "Content-Type": "application/json"}
         )
-        print(f"[BASE44] ✅ Call logged to Base44! Status: {resp.status_code}")
+        if resp.ok:
+            print(f"[BASE44] ✅ Call logged to Base44! Status: {resp.status_code}")
+        else:
+            print(f"[BASE44] ❌ Base44 push failed! Status: {resp.status_code} - {resp.text}")
     except Exception as e:
         print(f"[BASE44] ❌ Error pushing to DB: {e}")
 
