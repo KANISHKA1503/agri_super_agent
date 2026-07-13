@@ -595,6 +595,21 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
         }
         mapped_category = cat_map.get(intent.upper(), "General")
 
+        status = "answered"
+        unanswered_reason = ""
+        
+        # Check if the AI gave a fallback/failure response
+        ans_lower = english_answer.lower()
+        if "i will look into this" in ans_lower:
+            status = "unanswered"
+            unanswered_reason = "Knowledge Gap (LLM Failure)"
+        elif "could not fetch the weather" in ans_lower:
+            status = "unanswered"
+            unanswered_reason = "Weather API Failure"
+        elif "could not find the current price" in ans_lower:
+            status = "unanswered"
+            unanswered_reason = "Market Price Database Gap"
+
         payload = {
             "phone_number": "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -603,14 +618,14 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             "category": mapped_category,
             "farmer_query": query,
             "ai_response": answer,
-            "status": "answered",
+            "status": status,
             "crop_mentioned": meta.get("crop", ""),
             "location_mentioned": meta.get("location", ""),
             "disease_mentioned": meta.get("disease", ""),
             "scheme_mentioned": meta.get("scheme", ""),
             "farmer_query_english": english_query,
             "ai_response_english": english_answer,
-            "unanswered_reason": ""
+            "unanswered_reason": unanswered_reason
         }
         
         import requests
