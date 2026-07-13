@@ -595,19 +595,19 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
         }
         mapped_category = cat_map.get(intent.upper(), "General")
 
-        status = "Answered"
+        status = "answered"
         unanswered_reason = ""
         
         # Check if the AI gave a fallback/failure response
         ans_lower = english_answer.lower()
         if "i will look into this" in ans_lower:
-            status = "Unanswered"
+            status = "unanswered"
             unanswered_reason = "Knowledge Gap (LLM Failure)"
         elif "temporarily unavailable" in ans_lower and "weather" in ans_lower:
-            status = "Unanswered"
+            status = "unanswered"
             unanswered_reason = "Weather API Failure"
         elif "price data for" in ans_lower and "is not available right now" in ans_lower:
-            status = "Unanswered"
+            status = "unanswered"
             unanswered_reason = "Market Price Database Gap"
 
         payload = {
