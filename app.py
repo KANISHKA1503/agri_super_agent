@@ -606,6 +606,8 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             "status": "answered",
             "crop_mentioned": meta.get("crop", ""),
             "location_mentioned": meta.get("location", ""),
+            "disease_mentioned": meta.get("disease", ""),
+            "scheme_mentioned": meta.get("scheme", ""),
             "unanswered_reason": ""
         }
         
