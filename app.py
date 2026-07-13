@@ -560,6 +560,31 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
         return
         
     try:
+        # Fast metadata extraction for analytics dashboard
+        from router import call_llm
+        import json
+        
+        prompt = (
+            f"Analyze this farmer query: '{query}'\n"
+            "Extract any mentioned crop, location, disease/pest, or government scheme.\n"
+            "Respond ONLY with a valid JSON object using exactly these keys: 'crop', 'location', 'disease', 'scheme'.\n"
+            "If a piece of information is not mentioned, use an empty string as the value. Do not add markdown or comments."
+        )
+        
+        try:
+            meta_str = await asyncio.to_thread(
+                call_llm, 
+                user_prompt=prompt, 
+                system_prompt="You are a JSON data extractor. Output raw JSON only.", 
+                max_tokens=100
+            )
+            # Clean up markdown if LLM adds it
+            meta_str = meta_str.strip().strip("```json").strip("```").strip()
+            meta = json.loads(meta_str)
+        except Exception as e:
+            print(f"[BASE44] Extractor failed/parsing error: {e}")
+            meta = {"crop": "", "location": "", "disease": "", "scheme": ""}
+
         payload = {
             "phone_number": "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -569,8 +594,10 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             "farmer_query": query,
             "ai_response": answer,
             "status": "answered",
-            "crop_mentioned": "",
-            "location_mentioned": "",
+            "crop_mentioned": meta.get("crop", ""),
+            "location_mentioned": meta.get("location", ""),
+            "disease_mentioned": meta.get("disease", ""),
+            "scheme_mentioned": meta.get("scheme", ""),
             "unanswered_reason": ""
         }
         
