@@ -481,7 +481,7 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
     try:
         # 1. Routing
         print("[ROUTER] Analyzing farmer query...")
-        answer = process_farmer_query(transcript)
+        answer, intent = process_farmer_query(transcript)
         print(f"[ROUTER] [OK] Answer: {answer}")
 
         # 2. Text to Speech
@@ -522,7 +522,7 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         print("[PLAYBACK] [OK] Streaming complete.")
         
         # 5. Push to Base44 Database
-        asyncio.create_task(push_to_base44(stream_sid, answer, lang_code))
+        asyncio.create_task(push_to_base44(stream_sid, transcript, answer, lang_code, intent))
 
         # After answering, play a suffix in the farmer's native language
         from router import translate_to_indian_language
@@ -549,7 +549,7 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         print(f"[PLAYBACK ERROR] {e}")
         traceback.print_exc()
 
-async def push_to_base44(phone: str, answer: str, lang: str):
+async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent: str = "General"):
     """Pushes the completed call to the Base44 database webhook."""
     # We load these from the .env file so the API key stays secret
     base44_url = os.getenv("BASE44_API_URL")
@@ -565,8 +565,8 @@ async def push_to_base44(phone: str, answer: str, lang: str):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "duration_seconds": 45,  # Estimated for now
             "language_detected": lang,
-            "category": "General",   # We can extract intent later
-            "farmer_query": "Farmer's query via phone",
+            "category": intent,
+            "farmer_query": query,
             "ai_response": answer,
             "status": "answered",
             "crop_mentioned": "",
@@ -627,7 +627,7 @@ async def api_disease_advice(request):
     if not query:
         return {"result": "Please describe the problem."}
     try:
-        return {"result": process_farmer_query(query)}
+        return {"result": process_farmer_query(query)[0]}
     except Exception as e:
         return {"result": "Sorry, could not find advice."}
 
@@ -640,7 +640,7 @@ async def api_scheme_info(request):
     if not query:
         return {"result": "Please specify a scheme."}
     try:
-        return {"result": process_farmer_query(query)}
+        return {"result": process_farmer_query(query)[0]}
     except Exception as e:
         return {"result": "Sorry, could not find that info."}
 
@@ -653,7 +653,7 @@ async def api_general_query(request):
     if not query:
         return {"result": "Please ask a question."}
     try:
-        return {"result": process_farmer_query(query)}
+        return {"result": process_farmer_query(query)[0]}
     except Exception as e:
         return {"result": "Sorry, could not process your question."}
 
