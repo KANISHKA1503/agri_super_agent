@@ -267,6 +267,9 @@ async def handle_exotel_stream(websocket: WebSocket):
     seq_num_ref = [1]
     farmer_lang_code = ["en-IN"]  # Track farmer's detected language
     awaiting_feedback = [False]    # True when waiting for spoken feedback
+    
+    # Try to get phone number from websocket URL parameters
+    caller_phone = websocket.query_params.get("phone") or websocket.query_params.get("From") or websocket.query_params.get("caller_id")
 
     # VAD State
     audio_buffer = []
@@ -299,22 +302,15 @@ async def handle_exotel_stream(websocket: WebSocket):
                 try:
                     goodbye_wav = generate_tts_audio(goodbye_text, language_code=goodbye_lang)
                     if goodbye_wav:
-                        goodbye_pcm = convert_to_exotel_pcm(goodbye_wav)
+                        pcm = convert_to_exotel_pcm(goodbye_wav)
                         chunk_size = 3200
-                        for i in range(0, len(goodbye_pcm), chunk_size):
-                            chunk = goodbye_pcm[i:i + chunk_size]
-                            b64_payload = base64.b64encode(chunk).decode("utf-8")
-                            await websocket.send_json({
-                                "event": "media",
-                                "stream_sid": stream_sid,
-                                "media": {"payload": b64_payload}
-                            })
+                        for i in range(0, len(pcm), chunk_size):
+                            chunk = pcm[i:i + chunk_size]
+                            b64 = base64.b64encode(chunk).decode("utf-8")
+                            await websocket.send_json({"event": "media", "stream_sid": stream_sid, "media": {"payload": b64}})
                             await asyncio.sleep(0.18)
-                    print("[GOODBYE] Thank-you message sent. Ending call.")
                 except Exception as e:
                     print(f"[GOODBYE ERROR] {e}")
-                
-                # Wait for the goodbye audio to actually finish playing on the phone line
                 # 8kHz 16-bit mono = 16000 bytes per second
                 audio_duration = len(goodbye_pcm) / 16000 if 'goodbye_pcm' in locals() else 3
                 await asyncio.sleep(audio_duration + 0.5)  # Add 0.5s buffer
@@ -338,7 +334,7 @@ async def handle_exotel_stream(websocket: WebSocket):
                     
             # Process query and play answer
             playback_task = asyncio.create_task(
-                process_and_play(transcript, websocket, stream_sid, seq_num_ref, farmer_lang_code)
+                process_and_play(transcript, websocket, stream_sid, seq_num_ref, farmer_lang_code, caller_phone)
             )
         else:
             print("[SARVAM ASR] No speech recognized.")
@@ -357,7 +353,13 @@ async def handle_exotel_stream(websocket: WebSocket):
                 call_sid = start_data.get("call_sid")
                 media_format = start_data.get("media_format", {})
                 audio_encoding = media_format.get("encoding", "audio/x-l16")
-                print(f"[EXOTEL STREAM] 'start' | Stream: {stream_sid} | Call: {call_sid} | Encoding: {audio_encoding}")
+                
+                # Check if phone number is in custom_data
+                custom_data = start_data.get("custom_data", "")
+                if custom_data and len(custom_data) > 5 and not caller_phone:
+                    caller_phone = custom_data
+
+                print(f"[EXOTEL STREAM] 'start' | Stream: {stream_sid} | Call: {call_sid} | Phone: {caller_phone}")
 
                 # Send greeting immediately to keep the call alive
                 asyncio.create_task(send_greeting(websocket, stream_sid, seq_num_ref))
@@ -473,7 +475,7 @@ async def handle_exotel_stream(websocket: WebSocket):
         print("[EXOTEL STREAM] Session ended.\n")
 
 
-async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: str, seq_ref: list, farmer_lang_ref: list = None):
+async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: str, seq_ref: list, farmer_lang_ref: list = None, caller_phone: str = None):
     """
     Passes transcript to the router, generates TTS, transcodes to 8kHz PCM,
     and streams back to Exotel in chunks.
@@ -522,7 +524,8 @@ async def process_and_play(transcript: str, websocket: WebSocket, stream_sid: st
         print("[PLAYBACK] [OK] Streaming complete.")
         
         # 5. Push to Base44 Database
-        asyncio.create_task(push_to_base44(stream_sid, transcript, answer, lang_code, intent, english_query, english_answer))
+        phone_to_log = caller_phone if caller_phone else stream_sid
+        asyncio.create_task(push_to_base44(phone_to_log, transcript, answer, lang_code, intent, english_query, english_answer))
 
         # After answering, play a suffix in the farmer's native language
         from router import translate_to_indian_language
@@ -610,8 +613,21 @@ async def push_to_base44(phone: str, query: str, answer: str, lang: str, intent:
             status = "unanswered"
             unanswered_reason = "Market Price Database Gap"
 
+        demo_phone = os.getenv("DEMO_PHONE_NUMBER")
+        
+        # Determine the final phone number to display
+        # If 'phone' looks like a UUID (stream_sid), and we have a DEMO_PHONE_NUMBER, use the demo number
+        if len(phone) > 15 and demo_phone:
+            display_phone = demo_phone
+        elif phone and len(phone) <= 15:
+            # It's a real phone number extracted from URL/custom_data
+            display_phone = "+91 ****" + str(phone)[-4:] if not str(phone).startswith("+") else phone
+        else:
+            # Fallback to UUID masking
+            display_phone = "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000"
+
         payload = {
-            "phone_number": "+91 ****" + str(phone)[-4:] if phone else "+91 ****0000",
+            "phone_number": display_phone,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "duration_seconds": 45,  # Estimated for now
             "language_detected": lang,
